@@ -1,13 +1,16 @@
 use std::ffi::OsStr;
+use std::panic::resume_unwind;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 use fuser::{FileAttr, Filesystem, FileType, KernelConfig, ReplyAttr, ReplyDirectory, ReplyEntry, Request};
 use libc::{c_int, ENOENT, ENOSYS};
 use rusqlite::Connection;
 use log::debug;
+use crate::database;
+use crate::database::{Database, File};
 
 pub struct Fs {
-    pub conn : Connection,
+    db: Database,
 }
 
 impl Fs {
@@ -20,8 +23,9 @@ impl Fs {
             }
         };
 
+
         let mut fs = Fs{
-            conn
+            db: database::new(),
         };
 
         fs
@@ -30,7 +34,7 @@ impl Fs {
 
 impl Filesystem for Fs {
     fn init(&mut self, _req: &Request<'_>, _config: &mut KernelConfig) -> Result<(), c_int> {
-        self.conn.execute(
+        self.db.conn.execute(
             "CREATE TABLE files (
             inode INTEGER PRIMARY KEY AUTOINCREMENT,
             parent_inode INTEGER,
@@ -49,7 +53,7 @@ impl Filesystem for Fs {
             file_type: "dir".to_string(),
         };
 
-        self.conn.execute("INSERT INTO files (inode, parent_inode, size, path, file_type) VALUES (?1, ?2, ?3, ?4, ?5)", (&f.inode, &f.parent_inode, &f.size, &f.path, &f.file_type)).unwrap();
+        self.db.conn.execute("INSERT INTO files (inode, parent_inode, size, path, file_type) VALUES (?1, ?2, ?3, ?4, ?5)", (&f.inode, &f.parent_inode, &f.size, &f.path, &f.file_type)).unwrap();
 
         Ok(())
     }
@@ -57,7 +61,7 @@ impl Filesystem for Fs {
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         println!("getattr: ino={}", ino);
 
-        let mut stmt = self.conn.prepare("SELECT inode, parent_inode, size, path, file_type FROM files WHERE inode=:inode").unwrap();
+        let mut stmt = self.db.conn.prepare("SELECT inode, parent_inode, size, path, file_type FROM files WHERE inode=:inode").unwrap();
         let mut rows = stmt.query_map([ino], |row| {
             Ok(File {
                 inode: row.get_unwrap(0),
@@ -79,7 +83,7 @@ impl Filesystem for Fs {
             mtime: ts,
             ctime: ts,
             crtime: ts,
-            kind: f.get_file_type(),
+            kind: f.get_type(),
             perm: 0o755,
             nlink: 0,
             uid: 0,
@@ -96,8 +100,52 @@ impl Filesystem for Fs {
         }
     }
 
+    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        debug!("lookup: parent {:?}, name {:?}", parent, name);
+
+        let name_str = match name.to_str() {
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+            Some(n) => n,
+        };
+
+        let file = self.db.get_file(name_str, parent);
+
+        match file {
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+            Some(f) => {
+                let ts = SystemTime::now();
+                let attr = FileAttr {
+                    ino: f.inode,
+                    size: f.size,
+                    blocks: 0,
+                    atime: ts,
+                    mtime: ts,
+                    ctime: ts,
+                    crtime: ts,
+                    kind: f.get_type(),
+                    perm: 0o755,
+                    nlink: 0,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                    blksize: 0,
+                    flags: 0,
+                };
+                let ttl = Duration::from_secs(1);
+
+                //TODO create generation
+                reply.entry(&ttl, &attr, 0);
+            }
+        }
+    }
+
     fn mkdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, umask: u32, reply: ReplyEntry) {
-        println!("mkdir: parent {:?}, name {:?}, mode {:?}, umask {:?}", parent, name, mode, umask);
         debug!("mkdir: parent {:?}, name {:?}, mode {:?}, umask {:?}", parent, name, mode, umask);
         let f = File {
             inode: 0,
@@ -107,18 +155,19 @@ impl Filesystem for Fs {
             file_type: "dir".to_string(),
         };
 
-        self.conn.execute("INSERT INTO files (parent_inode, size, path, file_type) VALUES (?1, ?2, ?3, ?4)", (&f.parent_inode, &f.size, &f.path, &f.file_type)).unwrap();
+        self.db.conn.execute("INSERT INTO files (parent_inode, size, path, file_type) VALUES (?1, ?2, ?3, ?4)", (&f.parent_inode, &f.size, &f.path, &f.file_type)).unwrap();
 
         let ts = SystemTime::now();
+
         let attr = FileAttr {
-            ino: f.inode,
+            ino: 2,
             size: f.size,
             blocks: 0,
             atime: ts,
             mtime: ts,
             ctime: ts,
             crtime: ts,
-            kind: f.get_file_type(),
+            kind: f.get_type(),
             perm: 0o755,
             nlink: 0,
             uid: 0,
@@ -144,7 +193,7 @@ impl Filesystem for Fs {
 
         let mut off = offset;
 
-        let mut stmt = self.conn.prepare("SELECT inode, parent_inode, size, path, file_type FROM files WHERE parent_inode=:inode LIMIT 1000 OFFSET :offset").unwrap();
+        let mut stmt = self.db.conn.prepare("SELECT inode, parent_inode, size, path, file_type FROM files WHERE parent_inode=:inode LIMIT 1000 OFFSET :offset").unwrap();
         let mut rows = stmt.query_map([ino, offset as u64], |row| {
             Ok(File {
                 inode: row.get_unwrap(0),
@@ -170,20 +219,5 @@ impl Filesystem for Fs {
     }
 }
 
-pub struct File {
-    inode: u64,
-    parent_inode: u64,
-    size: u64,
-    path: String,
-    file_type: String,
-}
 
-impl File {
-    fn get_file_type(&self) -> FileType {
-        return if self.file_type == "dir" {
-            FileType::Directory
-        } else {
-            FileType::RegularFile
-        }
-    }
-}
+

@@ -1,4 +1,5 @@
 mod fs;
+mod database;
 use fs::Fs;
 
 use std::env;
