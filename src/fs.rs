@@ -1,11 +1,12 @@
+use std::error::Error;
 use std::ffi::OsStr;
 use std::panic::resume_unwind;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 use fuser::{FileAttr, Filesystem, FileType, KernelConfig, ReplyAttr, ReplyDirectory, ReplyEntry, Request};
-use libc::{c_int, ENOENT, ENOSYS};
+use libc::{c_int, EIO, ENOENT, ENOSYS};
 use rusqlite::Connection;
-use log::debug;
+use log::{debug, error, info};
 use crate::database;
 use crate::database::{Database, File};
 
@@ -34,13 +35,16 @@ impl Fs {
 
 impl Filesystem for Fs {
     fn init(&mut self, _req: &Request<'_>, _config: &mut KernelConfig) -> Result<(), c_int> {
+        info!("initializing database");
+
         self.db.conn.execute(
             "CREATE TABLE files (
             inode INTEGER PRIMARY KEY AUTOINCREMENT,
             parent_inode INTEGER,
             size INTEGER,
             path TEXT NOT NULL,
-            file_type TEXT NOT NULL
+            file_type TEXT NOT NULL,
+            UNIQUE(parent_inode, path)
         )",
             (), // empty list of parameters.
         ).unwrap();
@@ -59,7 +63,7 @@ impl Filesystem for Fs {
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        println!("getattr: ino={}", ino);
+        debug!("getattr: ino={}", ino);
 
         let mut stmt = self.db.conn.prepare("SELECT inode, parent_inode, size, path, file_type FROM files WHERE inode=:inode").unwrap();
         let mut rows = stmt.query_map([ino], |row| {
@@ -147,7 +151,7 @@ impl Filesystem for Fs {
 
     fn mkdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, umask: u32, reply: ReplyEntry) {
         debug!("mkdir: parent {:?}, name {:?}, mode {:?}, umask {:?}", parent, name, mode, umask);
-        let f = File {
+        let mut f = File {
             inode: 0,
             parent_inode: parent,
             size: 0,
@@ -155,7 +159,12 @@ impl Filesystem for Fs {
             file_type: "dir".to_string(),
         };
 
-        self.db.conn.execute("INSERT INTO files (parent_inode, size, path, file_type) VALUES (?1, ?2, ?3, ?4)", (&f.parent_inode, &f.size, &f.path, &f.file_type)).unwrap();
+        match self.db.add_file(&mut f) {
+            Ok(_) => {}
+            Err(err) => {
+                error!("{}", err);
+            }
+        }
 
         let ts = SystemTime::now();
 
@@ -183,7 +192,6 @@ impl Filesystem for Fs {
     }
 
     fn readdir(&mut self, _req: &Request<'_>, ino: u64, fh: u64, offset: i64, mut reply: ReplyDirectory) {
-        println!("readdir: ino={}, fh={}, offset={}", ino, fh, offset);
         debug!("readdir: ino={}, fh={}, offset={}", ino, fh, offset);
 
         // if offset == 0 {
@@ -193,21 +201,18 @@ impl Filesystem for Fs {
 
         let mut off = offset;
 
-        let mut stmt = self.db.conn.prepare("SELECT inode, parent_inode, size, path, file_type FROM files WHERE parent_inode=:inode LIMIT 1000 OFFSET :offset").unwrap();
-        let mut rows = stmt.query_map([ino, offset as u64], |row| {
-            Ok(File {
-                inode: row.get_unwrap(0),
-                parent_inode: row.get_unwrap(1),
-                size: row.get_unwrap(2),
-                path: row.get_unwrap(3),
-                file_type: row.get_unwrap(4),
-            })
-        }).unwrap();
+        let files = match self.db.get_files(ino, Some(offset)) {
+            Ok(f) => f,
+            Err(err) => {
+                error!("{}", err.to_string());
+                reply.error(EIO);
+                return
+            }
+        };
 
-        for file in rows {
-            let f = file.unwrap();
-            let buffer_full = reply.add(f.inode, off, FileType::Directory, f.path);
+        for file in files {
             off += 1;
+            let buffer_full = reply.add(file.inode, off, FileType::Directory, file.path);
 
             if buffer_full {
                 println!("reply directory buffer full");

@@ -1,3 +1,5 @@
+extern crate core;
+
 mod fs;
 mod database;
 use fs::Fs;
